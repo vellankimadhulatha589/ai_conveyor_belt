@@ -7,6 +7,8 @@ the belt is a *loop*.
 * Design document: **[docs/DESIGN.md](docs/DESIGN.md)** (what is monitored, how, why; read it second)
 * Plain-language walkthrough for newcomers (examples, libraries, model, run steps, how to present it):
   **[docs/EXPLAIN_PROJECT.txt](docs/EXPLAIN_PROJECT.txt)**
+* Code flow - which file calls which, starting from `scripts/start_all.py`:
+  **[docs/CODE_FLOW.md](docs/CODE_FLOW.md)**
 * AI chat logs: [ai_usage/](ai_usage/)
 
 ```
@@ -16,12 +18,11 @@ the belt is a *loop*.
  public belt images ─▶ vision detector ─▶ POST /vision/observations ─▶ loop-aware tracker ───────┘
 ```
 
-> **Status, honestly.** This repository was written without being able to install packages in the
-> authoring environment, so the numeric / ML / UI code has **not been executed yet** by its author. It was
-> syntax-checked and statically checked (no undefined names, all imports and config keys resolve), and the
-> standard-library parts - database schema and the vision tracker (12 unit tests) - were run. Run
-> the steps below; anything that breaks is a bug to fix, not a feature. The "Results" and "Screenshots"
-> sections contain marked placeholders instead of invented numbers.
+> **Status.** The whole pipeline has been run end to end (simulate -> ingest -> train -> API -> dashboard ->
+> vision loop) and the 32 unit tests pass. The vision model is trained on a public Kaggle dataset (see
+> [section 4](#4-vision-dataset)) and the dashboard screenshots are in [section 8](#8-dashboard-screenshots).
+> All sensor data comes from my own simulator, so the sensor results in section 7 show that the pipeline and
+> the evaluation logic work, not real-world accuracy.
 
 ---
 
@@ -60,16 +61,14 @@ end of the history, so the dashboard shows something immediately.
 python -m belt.vision.train
 ```
 
-No dataset yet? Use the offline **stand-in** (procedural images, *not* for submission) to try the pipeline:
-
-```bash
-python -m belt.vision.train --synthetic
-```
+For an offline smoke test without the Kaggle download you can generate procedural images instead
+(`python -m belt.vision.train --synthetic`); they are only meant for tests and are not the project's dataset.
 
 **Step 4 - start everything:**
 
 ```bash
 python scripts/start_all.py            # API + live sensor stream + dashboard, Ctrl+C stops all
+python scripts/start_all.py --seconds-per-sample 3   # same, but 'live': new readings every 3 s (see docs/CODE_FLOW.md, section 5)
 ```
 
 or in three terminals (also available as VS Code *Run and Debug* entries, see `.vscode/launch.json`):
@@ -144,28 +143,38 @@ Order matters only for steps 2 -> 4; the API can be started before bootstrap, it
 
 ## 4. Vision dataset
 
-> **TO CONFIRM BEFORE SUBMITTING:** the brief requires images from a public dataset, and "document where
-> you got it and why you chose it". I could not download or inspect any dataset from the authoring
-> environment, so **nothing below is verified**. Choose one, check its licence and labels, then replace this
-> box with the final decision.
+**Dataset used:** [Industrial Machinery Fault Image Dataset (Kaggle, zara2099)](https://www.kaggle.com/datasets/zara2099/industrial-machinery-fault-image-dataset).
+Licence: as stated on that Kaggle page (check it before redistributing the images; they are not committed to
+this repository, `data/vision_dataset/` is git-ignored).
 
-Candidates found by search (verify each):
-
-| Candidate | What it is (per its page) | Concerns |
+| Class folder | Images | Role |
 |---|---|---|
-| [Object detection in iron ore conveyor belt systems (Kaggle)](https://www.kaggle.com/datasets/asfarhossainsitab/object-detection-in-iron-ore-conveyor-belt-systems) | 6.25 GB, ~69.6 k files, image + video folders incl. a YOLO set; Apache 2.0 | page has no description; unclear whether classes are belt *damage* or *objects on the belt* |
-| Conveyor belt damage dataset described in [Applied Sciences 11(16):7282 (2021)](https://www.mdpi.com/2076-3417/11/16/7282) | 3000 images, 4 classes: surface wear, surface damage, breakdown, tear | the paper uses it; public availability and licence not verified |
-| [Conveyor belt damage (Ultralytics platform)](https://platform.ultralytics.com/abhishek-singhania/datasets/conveyor-belt-damage) | mining-environment images annotated for damage, holes, tears (segmentation) | needs account/export; licence unverified |
-| [Industrial Machinery Fault Image Dataset (Kaggle)](https://www.kaggle.com/datasets/zara2099/industrial-machinery-fault-image-dataset) | 234 images, folders crack / misalignment / normal / surface defects / wear incl. *conveyor rollers* | tiny; rollers, not belt surface |
+| `Normal condition` | 48 | normal (healthy) |
+| `Crack` | 47 | defect |
+| `Misalignment` | 53 | defect |
+| `Surface defects` | 43 | defect |
+| `Wear` | 43 | defect |
 
-Selection criteria I would apply: (1) shows the *belt surface* in a mining/industrial setting, (2) has a
-**normal** class and tear/damage/wear classes, (3) licence allows use, (4) preferably frames from several
-scenes so a scene-level split is possible (frames cut from one video leak between train and test).
+234 images in total, already one folder per class, so `scripts/yolo_to_folders.py` was not needed.
+
+**Why this dataset:** it is public, small enough to train on a laptop CPU in seconds, and it has a normal class
+plus several defect classes, which is what the detector and the loop tracker need.
+
+**Limitations (stated up front):**
+
+* The images show **conveyor rollers and idlers**, not the belt surface. It is a loose match for belt-surface
+  tear/wear; the defect names in the dashboard are the dataset's class names.
+* About 45 images per class: the hold-out set has only 10-15 images per class, so the accuracy figure is
+  noisy (one image moves it by several points).
+* Frames may come from the same scenes, so a random split can overestimate accuracy.
+* A dataset with real belt-surface damage (for example the larger iron-ore conveyor dataset on Kaggle, or the
+  4-class set of [Applied Sciences 11(16):7282](https://www.mdpi.com/2076-3417/11/16/7282)) would be the next
+  step; the code does not change, only the folder content.
 
 **How to plug a dataset in**
 
 * Folder-per-class: `data/vision_dataset/normal/*.jpg`, `.../tear/*.jpg`, `.../wear/*.jpg` ... Class names
-  `normal`, `good`, `ok`, `healthy`, `no_defect`, `normal condition` count as normal; everything else is a defect type.
+  `normal`, `good`, `ok`, `healthy`, `no_defect`, `normal condition` count as normal (matching ignores case); everything else is a defect type.
 * YOLO-format download (images + `labels/*.txt`)? Convert with
   `python scripts/yolo_to_folders.py --src <download folder> [--names tear,damage,wear]` (empty label file =
   normal, otherwise the class of the largest box).
@@ -213,38 +222,82 @@ splices, bad frames, encoder noise) against the real API, then scores the result
 
 ---
 
-## 7. Results (fill in after running)
+## 7. Results
 
-After `python scripts/bootstrap.py` the hold-out evaluation is printed and saved to
-`data/models/metrics.json`; the dashboard shows it in the *Model evaluation* expander. Paste the numbers here:
+Produced by `python scripts/bootstrap.py` (seed 7, 120 days of history, 49 scheduled faults). Hold-out =
+last part of the timeline, with a 7-day purge between train and test so a fault cannot straddle the split
+(10 faults in the test span). Full report: `data/models/metrics.json`, also in the dashboard's *Model
+evaluation* expander.
 
 | | ML model | Naive rule (any channel >= 4 sigma) |
 |---|---|---|
-| Fault-level recall (faults announced before failing) | `TODO` | `TODO` |
-| Median lead time before failure (h) | `TODO` | `TODO` |
-| False-alarm episodes / 100 point-days | `TODO` | `TODO` |
-| Snapshot precision / recall | `TODO` | `TODO` |
+| Faults announced before failing | 10 / 10 | 10 / 10 |
+| Median / minimum lead time before failure | 76.5 h / 26.5 h | 59.7 h / 26.5 h |
+| Snapshot precision / recall | 0.95 / 0.92 | 0.98 / 0.63 |
+| False-alarm episodes (per 100 point-days) | 5 (0.59) | 1 (0.12) |
+| Failure mode correct (of detected) | 97.6 % | not applicable |
+| ETA median absolute error | 8.8 h | not applicable |
 
-Vision: `data/models/vision_metrics.json` (per-class precision/recall) and the final lines of
-`run_loop` (frames, raw detections, unique defects, confirmed & matched, confirmed but false).
-`TODO`
+How to read this, without flattering it:
 
-Caveat to state once you have numbers: the model is trained and tested on **simulated** data, which proves
-the pipeline and the evaluation logic, not real-world accuracy.
+* Both approaches catch every fault in the test span, so the model's real gain is *earlier and steadier*
+  warnings (about 17 h more lead time, recall 0.92 vs 0.63) - and it pays for that with roughly five times
+  more false-alarm episodes. Which side of that trade a mine wants is an operations decision, not a modelling one.
+* **Ten test faults is a small sample.** Treat every digit as indicative. The model is trained and tested on
+  data from my own simulator, so this proves the pipeline and the evaluation logic, not real-world accuracy.
+* **The ETA uncertainty band is over-confident:** the 20-80 % quantile band should contain the true time
+  about 60 % of the time and contains it 39 % of the time. The point ETA is usable (8.8 h median error),
+  the band is not calibrated yet. Not fixed - listed in section 9.
+
+**Vision loop logic, measured with the procedural test images** (`python -m belt.vision.run_loop`, 12 hidden
+defects on a 10 km loop, 8 laps, 8 000 frames, 4 % blurred/dark frames, 2 splices, ~1 m encoder noise):
+
+| | before fixes | after fixes |
+|---|---|---|
+| real defects confirmed | 12 / 12 | 11 / 12 |
+| confirmed tracks with no real defect | 19 | 0 |
+
+Two defects of the first version were found by reading this output and are fixed: (1) the classifier read
+dark dust specks as "wear", so ~2 % of healthy frames were flagged; with 1 000 frames per lap, random
+flags in neighbouring segments in two different laps look like a defect. Fix: train with lighting / noise /
+dust augmentation (ranges wider than the simulator's, so it is not tuned to the test). (2) A frame showing
+a splice could be reported just outside the splice mask because of encoder error; the mask now includes the
+position error (`config.POSITION_ERROR_M`, with a unit test).
+
+The remaining miss is a 1.5 m "wear" defect: the camera sees ~2 m of every 10 m, so a defect that short is
+caught in only ~35 % of laps and was seen once in 8 laps. That is the coverage limit of the setup, not a
+bug - the dashboard shows it ("Belt surface imaged" about 18 %). More laps or a denser camera would fix it.
+
+Those test images are trivially separable (hold-out accuracy 1.0), so the table above tests the **loop
+logic** (de-duplication, splice masking, confirmation over laps), not classification quality.
+
+**Vision on the Kaggle dataset.** `python -m belt.vision.train` prints overall accuracy, per-class
+precision/recall and the confusion matrix and saves them to `data/models/vision_metrics.json`;
+`run_loop` prints the loop result (confirmed and matched, confirmed with no real defect). With 234 images
+and rollers instead of belt surface, treat those numbers as a demonstration that the real-data path works.
+The dashboard on this dataset (screenshots in section 8) shows more confirmed tracks than the 12 hidden
+defects, i.e. the classifier raises false alarms on these hard-to-separate images; the loop confirmation
+logic reduces but does not remove them.
 
 ---
 
 ## 8. Dashboard screenshots
 
-`TODO` - after Step 4/5 take screenshots and save them under `docs/screenshots/` with these names, then
-uncomment the lines:
+Overview: belt map (red diamonds are points predicted to fail), active anomalies and model predictions.
 
-<!--
 ![Overview: belt map, anomalies, predictions](docs/screenshots/01_overview.png)
-![Vision: loop chart, tracks, thumbnails](docs/screenshots/02_vision.png)
+
+Vision: loop chart, defect tracks and example frames from the Kaggle dataset.
+
+![Vision: loop chart, tracks, thumbnails](docs/screenshots/02_vision_loop.png)
+
+Point detail: sensor series of a point with a predicted failure (vibration rises before temperature).
+
 ![Point detail: vibration rising before temperature](docs/screenshots/03_point_detail.png)
+
+Data quality panel: rejected, flagged and duplicate readings.
+
 ![Data quality](docs/screenshots/04_data_quality.png)
--->
 
 ---
 
@@ -253,15 +306,16 @@ uncomment the lines:
 * **Real data first.** Everything is validated on simulated data. With real data the first week would go
   to the baseline (seasonality, ore types), to correcting the observable-window assumptions with reliability
   engineers, and to a labelled failure history instead of simulated work orders.
-* **Vision:** fine-tune a CNN/YOLO with segmentation masks, calibrate severity against repair decisions,
+* **Vision:** use real belt-surface images instead of rollers; fine-tune a CNN/YOLO with segmentation masks, calibrate severity against repair decisions,
   add a splice detector and encoder re-sync, a second camera for the pulley side, and forecast defect growth
   per track (the severity history is already stored).
 * **Prediction:** calibrate probabilities, smooth over cycles (hysteresis), per-mode thresholds, model the
   cascades between points (a seized idler raises neighbours' vibration), retraining and drift monitoring.
 * **Platform:** PostgreSQL/Timescale, a queue between simulator/edge and backend, authentication, Docker
   and a cloud deployment, alert delivery with acknowledgement.
-* **Process:** this repository was produced without running the numeric code (see status box). The very
-  first thing I would do is run it, read the hold-out report critically and fix what it exposes.
+* **Calibrate the prediction band** (conformal prediction on the hold-out) and report precision/recall per
+  failure mode, not only overall; with 10 test faults the evaluation itself needs far more history.
+* **Camera coverage:** a line-scan camera that images the whole belt instead of 2 m every 10 m.
 
 ---
 
@@ -274,7 +328,7 @@ belt/simulator/                   layout, fault schedule, generator, live stream
 belt/db.py  belt/ingest.py        SQLite schema, validation + storage
 belt/analysis/                    prepare (baseline, residuals), anomaly, features, predictor, train, pipeline
 belt/api/main.py                  FastAPI backend
-belt/vision/                      features, train, detector, tracker (loop logic), run_loop, synth (stand-in)
+belt/vision/                      features, train, detector, tracker (loop logic), run_loop, synth (test images only)
 belt/dashboard/app.py             Streamlit dashboard
 scripts/                          bootstrap, start_all, yolo_to_folders
 tests/                            tracker (stdlib), simulator/ingest, analysis, optional slow end-to-end
@@ -290,7 +344,7 @@ data/                             database, models, frames, dataset (generated /
 | Dashboard says "Cannot reach the backend" | start the API (`python -m uvicorn belt.api.main:app --port 8000`) |
 | Dashboard says "database is empty" | `python scripts/bootstrap.py` |
 | `too few failures in the history` | use more days: `bootstrap.py --days 120` |
-| Vision loop: `No such file ... vision_model.joblib` | `python -m belt.vision.train` (or `--synthetic`) first |
+| Vision loop: `No such file ... vision_model.joblib` | `python -m belt.vision.train` first (dataset in `data/vision_dataset/`) |
 | `pip` fails with `CERTIFICATE_VERIFY_FAILED` (corporate proxy) | configure your company's CA / index mirror for pip; do not disable TLS verification |
 | Port already in use | `start_all.py --api-port 8001 --dashboard-port 8502` |
 | Start over | stop everything, delete `data/belt.db*`, run `bootstrap.py` again (it recreates the database) |

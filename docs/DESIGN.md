@@ -198,9 +198,10 @@ Predictions are re-computed each cycle without smoothing, so a point can flicker
 
 ## 8. Vision
 
-**Dataset.** See the README ("Vision dataset") - the source and the reasons for the choice are documented
-there because it is the part you have to confirm and fill in. The pipeline needs images grouped into a
-*normal* class and one or more *defect* classes.
+**Dataset.** The Industrial Machinery Fault Image Dataset from Kaggle (234 images; classes Normal condition,
+Crack, Misalignment, Surface defects, Wear). Source, licence pointer and limitations (roller images, small
+size) are in the README ("Vision dataset"). The pipeline needs images grouped into a *normal* class and one
+or more *defect* classes.
 
 **Model.** Pillow + numpy features (colour stats, grey and gradient histograms, local-binary-pattern
 texture, a 6x6 grid of intensity/gradient) -> RandomForest. Why not a CNN: runs on a laptop CPU with no

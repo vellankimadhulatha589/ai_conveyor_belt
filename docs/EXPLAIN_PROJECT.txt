@@ -50,8 +50,8 @@ Analogy: a hospital patient monitor.
 We have no real mine, so there are two sources of data:
   - sensor data: made by a program we wrote (a SIMULATOR) that behaves
     like a real belt, including broken sensors and messy data
-  - belt images: pictures of belts from a public dataset
-    (a synthetic stand-in is used until the real dataset is chosen)
+  - belt images: pictures from a public Kaggle dataset (Industrial
+    Machinery Fault Image Dataset, 234 images, 5 classes)
 
 
 =====================================================================
@@ -371,10 +371,12 @@ Why not a CNN/YOLO: no GPU or PyTorch needed, trains in seconds, and the
 detector is a separate class so it can be swapped for a CNN later. On a
 real dataset a CNN/YOLO would be the better choice - say that openly.
 
-Dataset: the real public dataset still has to be chosen and its licence
-checked (candidates are listed in README section 3). Until then a
-SYNTHETIC stand-in (procedurally drawn belt images) is used; it is easy
-to separate, so its 100 % accuracy proves nothing.
+Dataset: the public Kaggle "Industrial Machinery Fault Image Dataset"
+(Normal condition, Crack, Misalignment, Surface defects, Wear; about 45
+images each; see README section 4). It shows conveyor rollers, not the
+belt surface, and is small, so say both limits openly. The procedural
+test images (--synthetic) are only for offline tests: they are easy to
+separate, so their 100 % accuracy proves nothing.
 
 Quality gate: blurred or too dark frames are rejected and never count as
 evidence. Training uses augmentation (brightness, noise, dust specks);
@@ -448,12 +450,12 @@ F4. Build the data and train the sensor model     (about 1-2 minutes)
     Re-running it deletes and rebuilds the database.
 
 F5. Train the vision model                        (about 10 seconds)
-        python -m belt.vision.train --synthetic
-    --synthetic makes the stand-in images. With a real dataset, put
-    images in data/vision_dataset/<class_name>/*.jpg (folder = label;
-    classes called normal/good/ok count as healthy) and run it WITHOUT
-    --synthetic. YOLO-format datasets can be converted with
-    scripts/yolo_to_folders.py.
+        python -m belt.vision.train
+    Put the Kaggle images in data/vision_dataset/<class_name>/*.jpg
+    (folder = label; "Normal condition", normal, good, ok count as
+    healthy). YOLO-format datasets can be converted with
+    scripts/yolo_to_folders.py (not needed for this dataset). Without
+    a download, "--synthetic" makes procedural test images instead.
 
 F6. Start everything
         python scripts/start_all.py --vision
@@ -556,7 +558,8 @@ Limits (say them first - it builds trust):
     own patterns.
   - 10 faults in the test period is a small sample.
   - The prediction range (20-80 %) is over-confident (39 % vs 60 %).
-  - The vision model has not yet been trained on the real public dataset.
+  - The vision dataset is small (234 images) and shows rollers, not the
+    belt surface, so its accuracy says little about real belt damage.
   - The camera sees only ~18 % of the belt surface per lap.
   - Sensor calibration drift is not handled (on purpose, documented).
   - The model raises more false alarms than the simple rule (5 vs 1).

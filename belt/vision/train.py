@@ -2,7 +2,7 @@
 
     python -m belt.vision.train                 # uses data/vision_dataset/<class>/*.jpg
     python -m belt.vision.train --dataset PATH
-    python -m belt.vision.train --synthetic     # generate the offline STAND-IN dataset first
+    python -m belt.vision.train --synthetic     # generate procedural TEST images first (offline smoke test)
 
 Folder name = class label. Classes named normal/good/ok/healthy/... (see config.NORMAL_CLASS_NAMES)
 are "normal", every other class is a defect type.
@@ -174,12 +174,12 @@ def train(root: Path, out_path: Path = config.VISION_MODEL_PATH, verbose: bool =
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--dataset", type=Path, default=config.VISION_DATASET_DIR)
-    ap.add_argument("--synthetic", action="store_true", help="generate the offline stand-in dataset first")
+    ap.add_argument("--synthetic", action="store_true", help="generate procedural test images first (offline smoke test; not the real dataset)")
     ap.add_argument("--n-per-class", type=int, default=150)
     args = ap.parse_args()
     if args.synthetic:
         n = synth.generate_dataset(args.dataset, args.n_per_class)
-        print(f"generated {n} SYNTHETIC stand-in images in {args.dataset} (not the submission dataset)")
+        print(f"generated {n} SYNTHETIC test images in {args.dataset} (not the real dataset)")
     train(args.dataset)
 
 

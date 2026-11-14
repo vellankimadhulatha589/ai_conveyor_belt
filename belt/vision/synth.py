@@ -1,9 +1,8 @@
-"""Procedural belt images - a **stand-in** so the whole system runs before you download a dataset.
+"""Procedural belt images for tests and offline smoke runs.
 
-!!  These images are NOT the vision dataset of the submission.  The brief requires images from a
-!!  public dataset; see the README ("Vision dataset") for where to get one and how to place it in
-!!  ``data/vision_dataset/<class_name>/*.jpg``.  This module only exists to test the pipeline and the
-!!  loop-handling logic end to end (and to make the unit/integration run possible offline).
+These images are NOT the project's vision dataset: that is the public Kaggle dataset described in the README
+("Vision dataset"), placed in `data/vision_dataset/<class_name>/*.jpg`.  This module only exists to test the
+pipeline and the loop-handling logic end to end (and to make the unit/integration runs possible offline).
 """
 from __future__ import annotations
 
