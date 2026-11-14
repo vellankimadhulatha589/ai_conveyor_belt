@@ -1,0 +1,5 @@
+data/
+.venv/
+.venvsudo/
+__pycache__/
+*.pyc

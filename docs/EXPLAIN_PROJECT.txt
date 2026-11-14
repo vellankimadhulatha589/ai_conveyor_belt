@@ -1,0 +1,643 @@
+=====================================================================
+ MINING CONVEYOR BELT HEALTH MONITOR - EXPLAINED FROM ZERO
+ (a script you can use to explain the project to anyone)
+=====================================================================
+
+How to use this file
+--------------------
+Part A  - the idea in plain words (2 minutes, no technical knowledge needed)
+Part B  - how the system is built, step by step, with examples
+Part C  - the libraries and why each one was chosen
+Part D  - the machine-learning model, the data, and how a failure is predicted
+Part E  - the image (vision) part and the "belt is a loop" problem
+Part F  - how someone else installs and runs it end to end
+Part G  - how to present it (order, demo, what to say)
+Part H  - honest limits + questions people will ask, with answers
+Part I  - glossary
+
+Numbers quoted in this file come from a real run of this project
+(seed 7, 120 days of simulated history). They will be the same on
+another machine because the simulator is deterministic.
+
+
+=====================================================================
+PART A - THE IDEA IN PLAIN WORDS
+=====================================================================
+
+A mining company has a conveyor belt 5 km long. It carries ore. The belt
+runs on hundreds of rollers ("idlers"), is pulled by a motor at the
+"head" (the drive), and is a closed loop: the belt goes out on top (carry
+side, 0-5 km) and comes back underneath (return side, 5-10 km).
+
+When something breaks (a roller bearing seizes, the belt drifts sideways
+and tears, the belt slips on the drive pulley) the whole mine stops.
+Every hour of stop costs a lot. So the goal is:
+
+    1. SEE what is happening on the belt right now       (monitoring)
+    2. NOTICE when something is wrong right now          (anomaly detection)
+    3. WARN what will break, where, and roughly when     (prediction)
+    4. LOOK at the belt surface for wear and cuts        (vision)
+    5. SHOW all of this to an operator on one screen     (dashboard)
+
+Analogy: a hospital patient monitor.
+  - sensors on the patient            = sensors on the belt
+  - "heart rate is 130 now"           = anomaly
+  - "this pattern usually ends in a
+     heart attack within a day"       = prediction
+  - the X-ray                         = vision (camera images)
+  - the screen at the nurses' desk    = dashboard
+
+We have no real mine, so there are two sources of data:
+  - sensor data: made by a program we wrote (a SIMULATOR) that behaves
+    like a real belt, including broken sensors and messy data
+  - belt images: pictures of belts from a public dataset
+    (a synthetic stand-in is used until the real dataset is chosen)
+
+
+=====================================================================
+PART B - HOW IT IS BUILT, STEP BY STEP
+=====================================================================
+
+The whole system in one picture:
+
+ [1 SIMULATOR] --sensor readings--> [2 BACKEND API] --> [3 DATABASE]
+   (messy data)                      (check, flag,        (SQLite file)
+                                      remove duplicates)       |
+                                                               v
+                                          [4 ANALYSIS: baseline, anomalies,
+                                           features, ML model, predictions]
+                                                               |
+ [5 CAMERA/IMAGES] --> [6 VISION DETECTOR] --> [7 LOOP TRACKER]|
+                                                    |          |
+                                                    v          v
+                                              [8 DASHBOARD  (Streamlit)]
+
+--- Step 1: the simulator (belt/simulator/) -------------------------
+
+What it does: invents 120 days of readings for 26 sensor points placed
+every 200 m along the 5 km belt, one reading every 5 minutes.
+Each point reports: vibration, temperature, lateral offset (how far the
+belt has drifted sideways), ambient temperature. The drive point (km 0)
+also reports belt speed, drive speed, belt load, motor current, voltage.
+
+Example of one healthy reading at a normal idler:
+    vibration  = 1.8 + 0.0003 * load + small random noise  -> about 2.4 mm/s
+    temperature = ambient + 14 + 0.0025 * load + noise     -> about 40 C
+
+It also injects FAILURES, using a table "failure -> which signals change
+-> how they change over time". Five failure types:
+
+  bearing       vibration rises first (days before), temperature rises
+                late (last hours). Example: P12 vibration goes 2.4 -> 15
+                mm/s over 10 days, then temperature climbs to 90 C.
+  mistrack      belt drifts sideways slowly: lateral offset 0 -> 160 mm.
+  slip          belt slips on the drive pulley: belt speed falls below
+                drive speed, motor heats up.
+  overload      too much ore: motor current high, belt speed drops.
+  undervoltage  supply voltage sags: 690 V down to roughly 640 V or lower.
+
+It also makes the data MESSY on purpose, because real data is messy:
+  1.2 % of readings missing, whole sensors going silent for hours,
+  sensors "stuck" repeating one value, spikes (4x to 9x), impossible
+  values (negative speed), 0.3 % duplicate rows, rows arriving in
+  shuffled order, and slow calibration drift (deliberately NOT fixed).
+It also stops the belt 6 hours a day (04:00-10:00) and after failures
+(repair downtime), because a stopped belt has no vibration - the
+analysis must not mistake "stopped" for "healthy" or "broken".
+
+It writes a work-order log (maintenance_log) when a failure is repaired.
+That log is what the ML model learns from (see Part D).
+
+Why a simulator: the assignment says the sensor data must come from a
+self-written simulator. Bonus: we KNOW the truth, so we can test whether
+the system really finds the faults.
+
+--- Step 2: the backend (belt/api/main.py, belt/ingest.py) ----------
+
+A small web server (FastAPI). The simulator "posts" readings to it:
+    POST /readings   [{"point_id":"P12","ts":"2026-05-01T10:00:00",
+                       "vibration":2.4,"temperature":41.0, ...}, ...]
+
+What the backend does with each row:
+  - unknown sensor id or unreadable timestamp  -> rejected (counted)
+  - text instead of a number ("n/a")           -> stored, flagged
+  - impossible value (temperature 900 C)       -> stored RAW, flagged,
+                                                  ignored in analysis
+  - same row twice                             -> second one ignored
+  - missing value                              -> stored as empty (NULL)
+Nothing is silently thrown away; a "data quality" panel shows counts
+(example from the run: 900,129 received, 2,621 duplicates, 2,656 flagged).
+
+Other endpoints let the dashboard ask for status, anomalies, predictions,
+vision tracks (see belt/api/main.py, open http://localhost:8000/docs).
+
+--- Step 3: the database (belt/db.py) -------------------------------
+
+SQLite = one file (data/belt.db), no server to install. Tables:
+  points, readings, maintenance_log, anomalies, predictions,
+  point_status, vision_observations, vision_tracks, meta.
+Why SQLite: zero setup, a reviewer can run it in one command, fast
+enough for ~1 million rows. Production would use PostgreSQL/Timescale.
+
+--- Step 4: analysis (belt/analysis/) --------------------------------
+
+4a. LEARN WHAT "NORMAL" LOOKS LIKE (prepare.py)
+    A fixed rule like "vibration > 5 is bad" is wrong because normal
+    vibration depends on how much ore is on the belt, and normal
+    temperature depends on the weather. So for every (sensor, point) the
+    code fits a small line, e.g.
+         expected_vibration = 1.8 + 0.0003 * belt_load
+    using a "robust" fit that ignores outliers (so faults do not
+    pollute the idea of normal).
+    Then residual = (measured - expected) / typical noise  -> a z-score.
+    Example: load 2000 t/h -> expected 2.4 mm/s, noise 0.2.
+             measured 9.0 -> z = (9.0 - 2.4) / 0.2 = 33 -> clearly abnormal.
+    Residuals are only computed while the belt is running.
+
+4b. ANOMALIES = "something is wrong NOW" (anomaly.py)
+    Rule: the median of the last 12 running samples (about 1 hour) must
+    be above 4 sigma AND above a practical minimum for that signal
+    (config.ANOMALY_RULES), in the bad direction. Median = a single
+    spike cannot trigger it. Severity low/medium/high/critical comes
+    from how big the deviation is.
+    Example: vibration +6.6 mm/s above expected -> "vibration_high,
+    medium" (thresholds 1.5 / 3.5 / 7.0 mm/s).
+    Three answers, not two: abnormal / normal / UNKNOWN (belt stopped
+    or sensor silent for hours -> we do not claim "normal").
+    Sensor faults are separate: "sensor_stuck_temperature",
+    "sensor_offline" - a broken sensor is a maintenance item, not a
+    belt failure.
+
+4c. FEATURES = turn history into numbers for the ML model (features.py)
+    Every 3 hours, for every point, build a "snapshot" of 57 numbers:
+      7 signals x 3 time windows (6 h, 24 h, 72 h) x (mean, max)  = 42
+      + 7 signals x 2 trends (24 h, 72 h)                         = 14
+      + 1 flag "is this the drive point"                          =  1
+    Example: for P12 the snapshot says "vibration z-score averaged +6
+    over the last 6 h, +4 over 24 h, and rising" - that single row is
+    what the model sees.
+    After a repair, the history of that point is cut off, so an old
+    fault does not cause ghost alarms on a fresh part.
+
+4d. PREDICTION = "what will fail, where, when" (predictor.py)
+    Explained fully in Part D.
+
+--- Step 5-7: vision (belt/vision/) - see Part E --------------------
+
+--- Step 8: the dashboard (belt/dashboard/app.py) -------------------
+
+A Streamlit web page that only talks to the API. It shows what the
+assignment required:
+  1. Status of every sensor point: green normal, orange abnormal,
+     red predicted failure, drawn along the belt route with terrain.
+  2. Active anomalies: where, what type, how severe.
+  3. Model predictions: what may fail, where, probability, when
+     (median ETA with a 20-80 % range).
+  4. Vision detections: loop chart, defect list, thumbnails.
+  Plus: a detail view per point (time series), data-quality panel,
+  model-evaluation panel. It refreshes itself every 5 seconds.
+
+Important detail: "now" in the dashboard is the newest data timestamp,
+not the clock on the wall, because the simulator runs faster than real
+time (30 simulated minutes per real second).
+
+
+=====================================================================
+PART C - LIBRARIES AND WHY
+=====================================================================
+
+Language: Python 3.12 (3.10+ works). Chosen because the whole data/ML
+ecosystem is in Python and one language keeps the project simple.
+
+  numpy        fast arrays/maths. Simulator formulas, residuals.
+  pandas       tables and time series: resample 5-minute data, rolling
+               windows, pivot readings into one column per sensor.
+  scikit-learn the ML models (gradient boosting for failures, random
+               forest for images), train/test split, metrics.
+  joblib       saves the trained model to a file (data/models/*.joblib)
+               and loads it again, so training is done once.
+  fastapi      the backend web API. Chosen over Flask because it
+               validates input and generates documentation (/docs)
+               automatically.
+  uvicorn      the server program that runs the FastAPI app.
+  pydantic     data validation used by FastAPI (installed with it).
+  requests     the simulator and vision loop use it to call the API.
+  streamlit    the dashboard in pure Python - no HTML/JavaScript needed,
+               auto-refresh, tables and charts in few lines.
+  plotly       interactive charts (belt map, loop chart, time series).
+  pillow       reading/modifying images for the vision part.
+  sqlite3      (standard library, nothing to install) the database.
+
+Why NOT the heavy options (and what to say if asked):
+  - No PyTorch / TensorFlow / GPU: the task is small, the tabular model
+    does not need deep learning, and anybody can run this on a laptop.
+  - No Docker / Kafka / Postgres: right for production, wrong for a
+    small learning project; they are listed under "what I would do next".
+
+Design choices in short:
+  - One config file (belt/config.py) holds every tunable number.
+  - API in the middle: simulator, analysis and dashboard are separate
+    parts that only talk through the API and the database, so each part
+    can be replaced (e.g. real sensors instead of the simulator).
+  - Idempotent ingest: sending the same data twice changes nothing.
+  - Honest evaluation: split by TIME, not randomly (see Part D).
+
+
+=====================================================================
+PART D - THE ML MODEL, THE DATA, AND HOW A FAILURE IS PREDICTED
+=====================================================================
+
+D1. What data does the model learn from?
+----------------------------------------
+Dataset = the simulated sensor history (about 900,000 rows, 120 days,
+26 points, 49 scheduled faults, 31 of them repaired in the history).
+It is NOT an external dataset; it comes from our simulator.
+
+The LABELS (the "right answers") come from the work-order log:
+  "P12 bearing failed on 2026-02-14 12:00, repaired by 18:00".
+That mirrors real life: a maintenance system records what broke and when;
+sensors alone never say "this is a bearing failure".
+
+Labelling a snapshot:
+  Take a snapshot of P12 at time T. Look at the work orders.
+  - If a bearing failure of P12 happens within 168 h after T
+    -> label = "bearing", time-to-failure = (failure time - T)
+  - otherwise -> label = "none"
+  The look-ahead window differs per failure type (bearing 168 h,
+  mistrack 72 h, slip 96 h, overload 12 h, undervoltage 120 h) because
+  they give different amounts of warning.
+  Result: 22,617 labelled snapshots, of which 1,104 are "a failure is
+  coming" (about 5 %; failures are rare, so "balanced" class weights
+  are used).
+
+D2. Which model, and why
+------------------------
+Two parts, both from scikit-learn "HistGradientBoosting":
+
+  (1) WHAT will fail: HistGradientBoostingClassifier
+      Input: the 57 numbers. Output: probability for each class:
+      none, bearing, mistrack, slip, overload, undervoltage.
+      Example output for P12 now:
+          none 0.01, bearing 0.97, others ~0.00  ->  p_fail = 0.99
+  (2) WHEN: three HistGradientBoostingRegressors with "quantile" loss
+      (20 %, 50 %, 80 %). They predict hours-to-failure.
+      Example: 20 % = 29 h, median = 33 h, 80 % = 37 h
+      -> shown as "~33 h (29-37 h)".
+  Dashboard rule: p_fail >= 0.5 -> "predicted failure" (red);
+                  0.3 - 0.5 -> "watch".
+
+Why gradient boosting (gradient-boosted decision trees):
+  - our data is a TABLE of numbers: this is where tree boosting is
+    usually the strongest and simplest choice
+  - handles MISSING values natively (belt stopped, sensor silent) - no
+    need to invent fill-in values
+  - no scaling of features needed
+  - copes with small, imbalanced data (1,104 positives)
+  - trains in seconds on a laptop CPU
+  - we can explain a prediction by showing the signals behind it
+    ("vibration +6.6 sigma over 6 h; temperature +2.1 sigma")
+
+A truthful way to say "best": say it is a GOOD, appropriate choice, not
+proven the best. It was compared against a simple rule baseline ("alarm
+if any signal is above 4 sigma"), NOT against other ML families (random
+forest, LSTM, logistic regression). Do not claim more than that.
+Deep learning (LSTM etc.) needs much more data and gives less
+explanation; a linear model cannot capture "vibration rising AND
+temperature still normal = early bearing failure".
+
+D3. How it was tested (and why the test is fair)
+------------------------------------------------
+- Split by TIME: train on the first part of the timeline, test on a later
+  part, with a 7-day gap so one fault cannot be on both sides. A random
+  split would leak (snapshots 3 h apart look almost identical).
+- The last 10 days are left out of the labelling, because failures there
+  have no "future" yet to confirm them.
+- A false alarm is only counted if no failure follows within a grace
+  period.
+Results on the test period (10 faults):
+                                   ML model        naive rule
+   faults warned before failing    10 / 10         10 / 10
+   median / min warning time       76.5 h / 26.5 h 59.7 h / 26.5 h
+   snapshot precision / recall     0.95 / 0.92     0.98 / 0.63
+   false-alarm episodes            5               1
+   failure type correct            97.6 %          -
+   median error of the ETA         8.8 h           -
+How to say it: "Both find every fault. The model warns about 17 hours
+earlier and keeps the alert on more reliably, but it raises more false
+alarms. Only 10 test faults, so these numbers are indicative, and the data
+is simulated."
+Known weak point: the 20-80 % range should contain the true time about
+60 % of the time; it contains it 39 %. The median ETA is useful, the range
+is over-confident (listed as future work).
+
+D4. Worked example, start to end (bearing failure at point P12)
+---------------------------------------------------------------
+(Illustrative timeline: the shape is what the simulator produces, the
+exact numbers are round figures to make it easy to follow.)
+ Day 0   vibration starts rising slowly (2.4 -> 4 mm/s). Temperature is
+         still normal. Rule-based alarms are silent.
+ Day 3   residual z-score of vibration at P12 is +6 over 6 h.
+         57-number snapshot built. Model: bearing 0.55 -> "predicted
+         failure", ETA ~ 7 days. Dashboard: P12 turns red.
+ Day 8   vibration 15 mm/s -> anomaly "vibration_high" (medium/high).
+ Last
+ hours   temperature shoots up (late bearing signature) ->
+         "overheating". By now the model gives ETA of a few hours.
+ Failure belt trips, repair crew works 6 h, a work order is written,
+         P12's history is cut, the point goes green again.
+Key message: vibration is the EARLY warning, temperature the LATE one -
+which is why we monitor both and why the model looks at trends.
+
+D5. Live behaviour
+------------------
+Every 8 seconds the API re-runs the analysis on the last 100 hours of
+data: baseline residuals -> anomalies -> features -> model -> store
+predictions -> update point status. The dashboard reads the result.
+
+
+=====================================================================
+PART E - THE IMAGE (VISION) PART AND THE LOOP PROBLEM
+=====================================================================
+
+E1. What it does
+----------------
+A camera looks at the belt surface. For each frame we need: is there
+wear / damage / a tear, how bad, where on the belt.
+
+Model: RandomForestClassifier on hand-made image features (colour
+statistics, histograms, texture "LBP", and a 6x6 grid of brightness and
+edges = 143 numbers). Classes: normal, wear, damage, tear.
+Why not a CNN/YOLO: no GPU or PyTorch needed, trains in seconds, and the
+detector is a separate class so it can be swapped for a CNN later. On a
+real dataset a CNN/YOLO would be the better choice - say that openly.
+
+Dataset: the real public dataset still has to be chosen and its licence
+checked (candidates are listed in README section 3). Until then a
+SYNTHETIC stand-in (procedurally drawn belt images) is used; it is easy
+to separate, so its 100 % accuracy proves nothing.
+
+Quality gate: blurred or too dark frames are rejected and never count as
+evidence. Training uses augmentation (brightness, noise, dust specks);
+without it dust was read as "wear" - a real bug found by running it.
+
+E2. The belt is a LOOP - why that matters
+-----------------------------------------
+The belt returns to the camera every lap (10 km loop at about 4 m/s = a lap
+every ~40 minutes).
+Consequences and what was done:
+ - the SAME defect is photographed lap after lap  -> identify a defect by
+   WHERE it sits on the loop (10 m segments), merge sightings into one
+   "track" ("dedup ratio 4.6" = 55 detections became 12 defects)
+ - a small defect is only caught in some laps (camera sees 2 m of every
+   10 m, about 18 % of the surface) -> need several laps
+ - a one-off false alarm (dust, ore lump) vs a real defect -> a track
+   becomes "confirmed" only after sightings in 2 DIFFERENT laps; a
+   suspected one that is not seen again for 5 laps is dismissed; a
+   confirmed one is never auto-cleared (damage does not heal)
+ - splices (joins of the belt) look like a stripe -> known positions
+   are masked, with a margin for position error
+ - position comes from an encoder with ~1 m error -> merge neighbours
+   within +-1 segment
+Result of the test run (12 hidden defects, 8 laps, 8,000 frames):
+   11 of 12 confirmed, 0 false confirmations. The one missed defect is
+   1.5 m long and was seen once.
+NOT solved (say this): belt twisting/turn-over, camera coverage of the
+return side, severity calibrated against real repair decisions, defect
+growth forecasting.
+
+
+=====================================================================
+PART F - HOW SOMEONE ELSE DEPLOYS IT END TO END
+=====================================================================
+
+What they need: a computer with Python 3.10 or newer (3.12 tested),
+about 1 GB free disk, a browser. VS Code is optional (there is a ready
+.vscode/launch.json). Internet is needed once, for "pip install".
+
+F1. Get the code
+    Copy the folder ai_conveyor_belt/ (or git clone it) to their machine.
+    Open a terminal in that folder.
+
+F2. Create an isolated Python environment and install libraries
+    Linux / macOS / WSL:
+        python3 -m venv .venv
+        source .venv/bin/activate
+    Windows (PowerShell):
+        py -m venv .venv
+        .venv\Scripts\Activate.ps1
+    then:
+        pip install -r requirements.txt
+    (takes a few minutes)
+    On Ubuntu/WSL, if "venv" is missing:  sudo apt install python3-venv
+    If pip fails with "CERTIFICATE_VERIFY_FAILED": the company proxy
+    (e.g. Zscaler) is intercepting HTTPS. Install the company root
+    certificate into the system trust store (do NOT turn verification
+    off), or use:  pip install --cert <corp-ca.pem> -r requirements.txt
+
+F3. (optional) check that everything works
+        python -m unittest discover -s tests -t .
+    Expected: "OK" (32 tests). Add RUN_SLOW=1 to also run the slow
+    end-to-end test (about 40 s).
+
+F4. Build the data and train the sensor model     (about 1-2 minutes)
+        python scripts/bootstrap.py
+    This: simulates 120 days -> sends them through the same ingest code
+    the live API uses -> writes the work orders -> trains and evaluates
+    the model (prints the metrics) -> runs a first analysis.
+    Creates data/belt.db and data/models/predictor.joblib.
+    Re-running it deletes and rebuilds the database.
+
+F5. Train the vision model                        (about 10 seconds)
+        python -m belt.vision.train --synthetic
+    --synthetic makes the stand-in images. With a real dataset, put
+    images in data/vision_dataset/<class_name>/*.jpg (folder = label;
+    classes called normal/good/ok count as healthy) and run it WITHOUT
+    --synthetic. YOLO-format datasets can be converted with
+    scripts/yolo_to_folders.py.
+
+F6. Start everything
+        python scripts/start_all.py --vision
+    This starts: the API (port 8000), the dashboard (port 8501), the
+    live data stream, and a simulated camera that makes 8 laps.
+    Then open  http://localhost:8501  in the browser.
+    API documentation: http://localhost:8000/docs
+    Stop everything with Ctrl+C.
+    Without --vision you can run the camera separately:
+        python -m belt.vision.run_loop --laps 8 --lap-delay 0
+
+F7. What they should see
+    - top row: simulated time, belt running, 22-24 points normal,
+      2-4 "predicted failure", about 11 confirmed belt defects
+    - map of the 5 km belt with coloured points
+    - a table of predictions such as "km 2.4 (P12) bearing 100 % ~33 h
+      (29-37 h)"
+    - the vision panel with the 10 km loop and defect thumbnails
+
+F8. Common problems
+    - "address already in use": a previous run is still active.
+      Find it with  ps aux | grep -E "uvicorn|streamlit"  and stop it.
+    - dashboard says no data: wait ~10 s after start, or run bootstrap.
+    - "No images found ... vision_dataset": run F5 first.
+    - start from a clean state at any time: run bootstrap again.
+
+F9. Running in VS Code instead of the terminal
+    Select the interpreter (Ctrl+Shift+P -> "Python: Select Interpreter"
+    -> .venv). Open "Run and Debug" (Ctrl+Shift+D) and run the entries
+    in order: "1 Bootstrap", the vision training, "Start all".
+
+F10. What "deployment" means here (be precise)
+    This is a LOCAL deployment: three processes on one machine plus one
+    database file. For a real mine you would add Docker containers,
+    PostgreSQL/TimescaleDB, a message queue between sensors and backend,
+    login/authentication, alert delivery (SMS/email), monitoring and
+    model re-training. Say this when someone asks "is it production
+    ready?" - the answer is "it is a working prototype with a clear path".
+
+
+=====================================================================
+PART G - HOW TO PRESENT IT (about 12 minutes)
+=====================================================================
+
+Order that works for someone with no background:
+
+ 1. (1 min) The problem. "A belt stops, the mine loses money. Can we
+    warn before it breaks?" Use the hospital-monitor analogy.
+ 2. (2 min) The data. "No real mine, so I wrote a simulator. Here are
+    the five ways a belt fails, and what each looks like in the data."
+    Draw: vibration rising early, temperature late (bearing).
+    Mention that the data is deliberately messy.
+ 3. (2 min) The pipeline picture from Part B (simulator -> API ->
+    database -> analysis -> dashboard). One sentence per box.
+ 4. (2 min) "Normal" and anomalies. Use the example: expected vibration
+    2.4, measured 9.0, z = 33, belt stopped is "unknown" not "normal".
+ 5. (2 min) The model. Snapshot of 57 numbers -> probabilities and ETA.
+    Show the results table and say plainly what it does and does not
+    prove (simulated data, 10 test faults, over-confident range).
+ 6. (2 min) Vision and the loop. "The same defect is seen every lap, so I
+    track defects by position." Show the dedup number 55 -> 12 and the
+    two bugs found by running it.
+ 7. (1 min) Live demo (below).
+ 8. (1 min) What I would do differently (README section 9).
+
+Live demo script (everything already running):
+   a. Open http://localhost:8501.
+   b. Point at the four KPI numbers, then the belt map: "red points are
+      predicted failures".
+   c. Open the predictions table: "P12 bearing, 100 %, about 33 hours".
+   d. Open "Sensor point detail" for that point and show vibration
+      rising BEFORE temperature.
+   e. Scroll to the vision panel: loop chart, one dot per physical
+      defect, thumbnail of the worst one.
+   f. Open "Data quality": "this is how much garbage came in and how it
+      was handled".
+   g. Optional: show http://localhost:8000/docs - the API.
+
+Say it in this style (example):
+   "I did not trust a fixed threshold, because normal vibration depends on
+    load. So the system learns what normal is for each sensor and
+    measures how far the reading is from it. I did not trust a random
+    train/test split either, because neighbouring snapshots are almost
+    the same, so I split by time with a gap."
+Statements like that show the thinking, which is what is being judged.
+
+Things to prepare before a demo:
+   - run F4, F5, F6 about 2 minutes before, so data and predictions exist
+   - have the README open on "Results" and "Design decisions"
+   - take the screenshots and put them into docs/screenshots/
+
+
+=====================================================================
+PART H - HONEST LIMITS AND LIKELY QUESTIONS
+=====================================================================
+
+Limits (say them first - it builds trust):
+  - All sensor data is simulated; results show the pipeline works, not
+    real-world accuracy. The model could have learned the simulator's
+    own patterns.
+  - 10 faults in the test period is a small sample.
+  - The prediction range (20-80 %) is over-confident (39 % vs 60 %).
+  - The vision model has not yet been trained on the real public dataset.
+  - The camera sees only ~18 % of the belt surface per lap.
+  - Sensor calibration drift is not handled (on purpose, documented).
+  - The model raises more false alarms than the simple rule (5 vs 1).
+
+Questions and answers:
+ Q: Why is this model "the best"?
+ A: I do not claim it is the best. It fits tabular data with missing
+    values and few examples, is fast and explainable, and beats a simple
+    rule on recall and warning time. I did not benchmark other model
+    families; that is a next step.
+
+ Q: How can it predict a failure it has never seen?
+ A: It cannot. It learns from the 31 repaired failures in history and
+    recognises the same early patterns. A new failure type would need new
+    data and labels.
+
+ Q: Why simulate instead of using real data?
+ A: The assignment requires a simulator for sensor data. It also lets me
+    check against the true fault times.
+
+ Q: Where do the labels come from - did the model cheat by seeing the
+    simulator's secret schedule?
+ A: No. Labels come only from the work-order log (what a maintenance
+    system would hold). The hidden schedule is used only to build that
+    log and to score results.
+
+ Q: What if a sensor breaks?
+ A: Stuck or silent sensors are detected and reported as sensor faults,
+    their samples are excluded, and the point shows "unknown" instead of
+    a wrong "normal".
+
+ Q: What if the belt is stopped?
+ A: Residuals are only computed while running; the status becomes
+    "unknown" after a few hours of no data rather than "normal".
+
+ Q: Why SQLite / Streamlit / FastAPI?
+ A: Zero setup so anyone can run it in minutes; the structure (API in
+    the middle) allows replacing each piece later.
+
+ Q: How would it scale to a real mine?
+ A: PostgreSQL/Timescale, a queue between sensors and backend,
+    containers, per-site baselines, authentication, alert delivery,
+    scheduled re-training and drift monitoring.
+
+ Q: Why does the same defect not count 8 times?
+ A: Defects are identified by position on the loop, not by photo; all
+    sightings within one segment +-1 merge into one track.
+
+
+=====================================================================
+PART I - GLOSSARY
+=====================================================================
+anomaly          something abnormal happening right now
+prediction       an estimate that something will fail, and when
+sensor point     one measuring station on the belt (26 of them)
+idler            a roller that supports the belt
+head / drive     the motor end of the belt
+residual         measured value minus what was expected
+z-score / sigma  residual divided by the usual noise; 4 sigma = very
+                 unlikely to be normal
+baseline         the learned idea of "normal" for a sensor
+snapshot         one row of 57 numbers describing a point at one time
+feature          one input number for the ML model
+label            the right answer used for training (none/bearing/...)
+work order       maintenance record: what broke, when, repaired when
+hold-out         later data kept away from training to test honestly
+precision        of the alarms raised, how many were real
+recall           of the real problems, how many were caught
+lead time        how long before the failure the warning came
+quantile         "20 % quantile" = a value that the truth is below 20 %
+                 of the time; 20 % and 80 % give a range
+track            one physical belt defect, merged from many sightings
+lap              one full trip of the belt loop past the camera
+splice           the join where the belt ends were vulcanised together
+ETA              estimated time until failure
+API              the program that other programs talk to over HTTP
+idempotent       doing it twice has the same effect as once
+=====================================================================
+ Where to find things:
+   README.md              main document (run steps, design, results)
+   docs/DESIGN.md         full design document
+   belt/config.py         every tunable number
+   data/models/metrics.json   the evaluation numbers quoted above
+=====================================================================
